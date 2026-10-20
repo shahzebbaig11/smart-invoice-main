@@ -1,7 +1,6 @@
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:5000/api";
 const TOKEN_KEY = "smart-invoice-auth-token";
 
-
 type ApiEnvelope<T> = {
   success: boolean;
   data: T;
