@@ -1,0 +1,370 @@
+"""Backend API regression tests."""
+
+from __future__ import annotations
+
+import importlib
+from io import BytesIO
+import os
+import sys
+from pathlib import Path
+
+import pytest
+import yaml
+
+
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+
+@pytest.fixture(scope="session")
+def client(tmp_path_factory):
+    """Create a Flask test client with an isolated SQLite database."""
+    tmp_path = tmp_path_factory.mktemp("smart_invoice_backend")
+    config = {
+        "app": {
+            "environment": "testing",
+            "debug": False,
+            "secret_key": "test-secret-key",
+        },
+        "server": {"host": "127.0.0.1", "port": 5000},
+        "cors": {"allow_all": True},
+        "database": {"engine": "sqlite", "sqlite": {"path": str(tmp_path / "db.sqlite3")}},
+        "outputs": {
+            "base_dir": str(tmp_path / "outputs"),
+            "invoices_dir": str(tmp_path / "outputs" / "invoices"),
+            "reports_dir": str(tmp_path / "outputs" / "reports"),
+            "assets_dir": str(tmp_path / "outputs" / "assets"),
+            "backups_dir": str(tmp_path / "outputs" / "backups"),
+        },
+        "email": {"enabled": False},
+        "auth": {
+            "enabled": True,
+            "allow_registration": True,
+            "token_expiry_hours": 24,
+            "admin_username": "admin",
+            "admin_password": "admin123",
+            "admin_email": "admin@example.com",
+        },
+        "tax": {"max_gst_rate": 28, "default_supply_type": "intrastate"},
+    }
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    os.environ["APP_CONFIG_PATH"] = str(config_path)
+
+    app_module = importlib.import_module("app")
+    app_module.app.config.update(TESTING=True)
+    return app_module.app.test_client()
+
+
+def _login(client, username: str = "admin", password: str = "admin123") -> dict[str, str]:
+    response = client.post("/api/auth/login", json={"username": username, "password": password})
+    assert response.status_code == 200
+    token = response.get_json()["data"]["token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _invoice_payload(invoice_number: str = "") -> dict:
+    return {
+        "invoice_number": invoice_number,
+        "client_name": "Acme Services",
+        "client_gstin": "24ABCDE1234F1Z8",
+        "client_address": "Ahmedabad, Gujarat",
+        "date": "2026-05-03",
+        "due_date": "2026-05-18",
+        "supply_type": "intrastate",
+        "items": [
+            {"item_name": "Consulting", "quantity": 2, "price": 1000, "gst_rate": 18},
+            {"item_name": "Hosting", "quantity": 1, "price": 500, "gst_rate": 5},
+        ],
+    }
+
+
+def test_invoice_crud_pdf_and_audit(client):
+    """Create, update, download PDF, record payment, void, audit, and delete an invoice."""
+    headers = _login(client)
+    created = client.post("/api/invoices", json=_invoice_payload(), headers=headers)
+    assert created.status_code == 201
+    invoice = created.get_json()["data"]
+    assert invoice["subtotal"] == 2500.0
+    assert invoice["gst_amount"] == 385.0
+    assert invoice["total"] == 2885.0
+
+    invoice_id = invoice["id"]
+    pdf = client.get(f"/api/invoices/{invoice_id}/pdf", headers=headers)
+    assert pdf.status_code == 200
+    assert pdf.headers["Content-Type"].startswith("application/pdf")
+
+    payload = _invoice_payload(invoice["invoice_number"])
+    payload["client_name"] = "Acme Services Updated"
+    updated = client.put(f"/api/invoices/{invoice_id}", json=payload, headers=headers)
+    assert updated.status_code == 200
+    assert updated.get_json()["data"]["client_name"] == "Acme Services Updated"
+
+    payment = client.post(
+        f"/api/invoices/{invoice_id}/payments",
+        json={"amount": 1000, "date": "2026-05-04", "mode": "UPI"},
+        headers=headers,
+    )
+    assert payment.status_code == 201
+    assert payment.get_json()["data"]["status"] == "partially paid"
+
+    voided = client.post(f"/api/invoices/{invoice_id}/void", json={"reason": "test void"}, headers=headers)
+    assert voided.status_code == 200
+    assert voided.get_json()["data"]["status"] == "void"
+
+    audit = client.get(f"/api/invoices/{invoice_id}/audit", headers=headers)
+    assert audit.status_code == 200
+    actions = {row["action"] for row in audit.get_json()["data"]}
+    assert {"created", "updated", "payment_recorded", "voided"}.issubset(actions)
+
+    deleted = client.delete(f"/api/invoices/{invoice_id}", headers=headers)
+    assert deleted.status_code == 200
+
+
+def test_validation_errors(client):
+    """Reject empty invoices and invalid GST values."""
+    headers = _login(client)
+    response = client.post(
+        "/api/invoices",
+        json={"client_name": "", "items": [{"item_name": "", "quantity": 0, "price": -1, "gst_rate": 40}]},
+        headers=headers,
+    )
+    assert response.status_code == 400
+    errors = response.get_json()["errors"]
+    assert "client_name" in errors
+    assert "items[0].quantity" in errors
+    assert "items[0].gst_rate" in errors
+
+
+def test_user_scoping_allows_same_invoice_number_per_user(client):
+    """Allow separate users to use the same invoice number while hiding each other's data."""
+    admin_headers = _login(client)
+    admin_invoice = client.post(
+        "/api/invoices",
+        json=_invoice_payload("INV-SAME"),
+        headers=admin_headers,
+    )
+    assert admin_invoice.status_code == 201
+
+    registered = client.post(
+        "/api/auth/register",
+        json={"username": "demo-user", "email": "demo@example.com", "password": "secret123"},
+    )
+    assert registered.status_code == 201
+    user_headers = _login(client, "demo-user", "secret123")
+    user_invoice = client.post(
+        "/api/invoices",
+        json=_invoice_payload("INV-SAME"),
+        headers=user_headers,
+    )
+    assert user_invoice.status_code == 201
+
+    listed = client.get("/api/invoices", headers=user_headers)
+    assert listed.status_code == 200
+    invoices = listed.get_json()["data"]
+    assert len(invoices) == 1
+    assert invoices[0]["owner_user_id"] == registered.get_json()["data"]["id"]
+
+
+def test_gst_breakdown_split():
+    """Split GST into CGST/SGST for intrastate and IGST for interstate."""
+    from utils.helpers import calculate_item_totals, get_gst_breakdown
+
+    items = [calculate_item_totals({"item_name": "Service", "quantity": 1, "price": 1000, "gst_rate": 18})]
+    intra = get_gst_breakdown(items, "intrastate")[0]
+    inter = get_gst_breakdown(items, "interstate")[0]
+    assert intra["cgst"] == 90.0
+    assert intra["sgst"] == 90.0
+    assert intra["igst"] == 0.0
+    assert inter["cgst"] == 0.0
+    assert inter["sgst"] == 0.0
+    assert inter["igst"] == 180.0
+
+
+def test_recurring_imports_reminders_gst_report_and_portal(client):
+    """Cover recurring profiles, imports, reminders, GST export, portal links, and attachments."""
+    headers = _login(client)
+
+    client_csv = b"name,gstin,address,state,email\nRecurring Client,24ABCDE1234F1Z8,Ahmedabad,Gujarat,billing@example.com\n"
+    imported_clients = client.post(
+        "/api/clients/import",
+        data={"file": (BytesIO(client_csv), "clients.csv")},
+        headers=headers,
+        content_type="multipart/form-data",
+    )
+    assert imported_clients.status_code == 200
+    assert imported_clients.get_json()["data"]["created_count"] == 1
+
+    product_csv = b"name,description,hsn_sac,price,gst_rate,unit\nMonthly Support,Support plan,9983,1500,18,month\n"
+    imported_products = client.post(
+        "/api/products/import",
+        data={"file": (BytesIO(product_csv), "products.csv")},
+        headers=headers,
+        content_type="multipart/form-data",
+    )
+    assert imported_products.status_code == 200
+    assert imported_products.get_json()["data"]["created_count"] == 1
+
+    recurring_payload = {
+        "name": "Monthly Support",
+        "frequency": "monthly",
+        "next_run_date": "2026-05-01",
+        "invoice": _invoice_payload(),
+    }
+    recurring = client.post("/api/recurring-invoices", json=recurring_payload, headers=headers)
+    assert recurring.status_code == 201
+    assert recurring.get_json()["data"]["frequency"] == "monthly"
+
+    run_due = client.post("/api/recurring-invoices/run-due", headers=headers)
+    assert run_due.status_code == 200
+    assert "generated_count" in run_due.get_json()["data"]
+
+    invoice = client.post("/api/invoices", json=_invoice_payload(), headers=headers).get_json()["data"]
+    invoice_id = invoice["id"]
+
+    link = client.post(f"/api/invoices/{invoice_id}/public-link", headers=headers)
+    assert link.status_code == 200
+    token = link.get_json()["data"]["token"]
+    public_invoice = client.get(f"/api/portal/{token}")
+    assert public_invoice.status_code == 200
+    assert public_invoice.get_json()["data"]["invoice_number"] == invoice["invoice_number"]
+
+    attachment = client.post(
+        f"/api/invoices/{invoice_id}/attachments",
+        data={"file": (BytesIO(b"hello"), "work-proof.pdf")},
+        headers=headers,
+        content_type="multipart/form-data",
+    )
+    assert attachment.status_code == 201
+
+    proof = client.post(
+        f"/api/portal/{token}/payment-proof",
+        data={"file": (BytesIO(b"paid"), "payment-proof.pdf")},
+        content_type="multipart/form-data",
+    )
+    assert proof.status_code == 201
+
+    gst_report = client.get("/api/reports/gst?month=5&year=2026", headers=headers)
+    assert gst_report.status_code == 200
+    assert "spreadsheet" in gst_report.headers["Content-Type"] or "excel" in gst_report.headers["Content-Type"]
+
+    settings = client.put(
+        "/api/reminders/settings",
+        json={
+            "auto_enabled": True,
+            "days_ahead": 30,
+            "email_template": "Dear {client_name}, invoice {invoice_number} is due on {due_date}.",
+        },
+        headers=headers,
+    )
+    assert settings.status_code == 200
+    assert settings.get_json()["data"]["auto_enabled"] is True
+
+    sent = client.post("/api/reminders/payments/send", json={"days": 30}, headers=headers)
+    assert sent.status_code == 200
+    history = client.get("/api/reminders/settings", headers=headers)
+    assert history.status_code == 200
+    assert isinstance(history.get_json()["data"]["history"], list)
+
+
+def test_admin_settings_and_email_verification(client):
+    """Cover admin runtime settings and development email verification flow."""
+    headers = _login(client)
+    updated = client.put("/api/users/admin/settings", json={"registration_enabled": True}, headers=headers)
+    assert updated.status_code == 200
+
+    registered = client.post(
+        "/api/auth/register",
+        json={"username": "verify-user", "email": "verify@example.com", "password": "secret123"},
+    )
+    assert registered.status_code == 201
+    token = registered.get_json()["data"].get("verification_token")
+    assert token
+
+    verified = client.post("/api/auth/verify-email", json={"token": token})
+    assert verified.status_code == 200
+    assert verified.get_json()["data"]["email_verified"] is True
+
+
+def test_security_scheduler_and_portal_review(client):
+    """Cover login activity, scheduler logs, public link revoke, and payment proof review."""
+    headers = _login(client)
+    invoice = client.post("/api/invoices", json=_invoice_payload(), headers=headers).get_json()["data"]
+
+    link = client.post(f"/api/invoices/{invoice['id']}/public-link", json={"expiry_days": 3}, headers=headers)
+    assert link.status_code == 200
+    assert link.get_json()["data"]["expires_at"]
+
+    proof = client.post(
+        f"/api/portal/{link.get_json()['data']['token']}/payment-proof",
+        data={"file": (BytesIO(b"paid"), "proof.pdf")},
+        content_type="multipart/form-data",
+    )
+    assert proof.status_code == 201
+
+    reviewed = client.post(
+        f"/api/invoices/{invoice['id']}/payment-proof/review",
+        json={"status": "approved"},
+        headers=headers,
+    )
+    assert reviewed.status_code == 200
+    assert reviewed.get_json()["data"]["payment_proof_status"] == "approved"
+
+    revoked = client.delete(f"/api/invoices/{invoice['id']}/public-link", headers=headers)
+    assert revoked.status_code == 200
+    public_after_revoke = client.get(f"/api/portal/{link.get_json()['data']['token']}")
+    assert public_after_revoke.status_code == 404
+
+    jobs = client.post("/api/jobs/run", headers=headers)
+    assert jobs.status_code == 200
+    job_status = client.get("/api/jobs", headers=headers)
+    assert job_status.status_code == 200
+    assert isinstance(job_status.get_json()["data"]["logs"], list)
+
+    overview = client.get("/api/users/admin/overview", headers=headers)
+    assert overview.status_code == 200
+    assert isinstance(overview.get_json()["data"]["login_activity"], list)
+
+
+def test_estimates_and_expenses(client):
+    """Cover estimate conversion and expense GST input tracking."""
+    headers = _login(client)
+    estimate_payload = {
+        "client_name": "Quote Client",
+        "client_gstin": "27ABCDE1234F1Z8",
+        "client_address": "Mumbai, Maharashtra",
+        "date": "2026-05-11",
+        "valid_until": "2026-06-10",
+        "supply_type": "interstate",
+        "items": [{"item_name": "Design Retainer", "quantity": 1, "price": 10000, "gst_rate": 18}],
+    }
+    created = client.post("/api/estimates", json=estimate_payload, headers=headers)
+    assert created.status_code == 201
+    estimate = created.get_json()["data"]
+    assert estimate["estimate_number"] == "QT-0001"
+    assert estimate["total"] == 11800.0
+
+    converted = client.post(f"/api/estimates/{estimate['id']}/convert", headers=headers)
+    assert converted.status_code == 200
+    assert converted.get_json()["data"]["client_name"] == "Quote Client"
+
+    expense = client.post(
+        "/api/expenses",
+        json={
+            "vendor_name": "Cloud Vendor",
+            "gstin": "29ABCDE1234F1Z8",
+            "category": "Software",
+            "expense_date": "2026-05-11",
+            "taxable_amount": 2500,
+            "gst_rate": 18,
+            "payment_mode": "Card",
+        },
+        headers=headers,
+    )
+    assert expense.status_code == 201
+    assert expense.get_json()["data"]["gst_amount"] == 450.0
+
+    listed = client.get("/api/expenses", headers=headers)
+    assert listed.status_code == 200
+    assert len(listed.get_json()["data"]) == 1
